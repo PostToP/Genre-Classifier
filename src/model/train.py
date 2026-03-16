@@ -5,10 +5,10 @@ from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
-from transformers import AutoFeatureExtractor
+from transformers import AutoFeatureExtractor, get_linear_schedule_with_warmup
 import torchaudio
 from model.model import PretrainedGenreTransformer, evaluate_model
-from config.config import SAMPLE_RATE, TRANSFORMER_MODEL_NAME
+from config.config import SAMPLE_RATE, TABLE, TRANSFORMER_MODEL_NAME, NUM_LABELS
 import numpy as np
 from torch.amp import autocast, GradScaler
 
@@ -34,13 +34,18 @@ class GenreDataset(Dataset):
         file_path = self.audio_dir / f"{row['yt_id']}_chunk_{row['chunk_index']}.wav"
         waveform, sr = torchaudio.load(file_path)
 
-        labels = torch.tensor(row["labels"], dtype=torch.float32)
+        raw_label = row["genres"]
+        if isinstance(raw_label, (list, tuple, np.ndarray, pd.Series)):
+            raw_label = raw_label[0]
+
+        label_id = TABLE[raw_label] if isinstance(raw_label, str) else int(raw_label)
+        label = torch.tensor(label_id, dtype=torch.long)
 
         inputs = self.feature_extractor(
             waveform.numpy(), sampling_rate=SAMPLE_RATE, return_tensors="pt"
         )
 
-        return inputs["input_values"].squeeze(0), labels
+        return inputs["input_values"].squeeze(0), label
 
 
 def set_seed(seed: int):
@@ -74,12 +79,12 @@ def run_with_seed(seed: int = None, verbose: bool = True):
     g = torch.Generator()
     g.manual_seed(seed)
 
-    BATCH_SIZE = 24
+    BATCH_SIZE = 20
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id),
         generator=g,
@@ -88,13 +93,13 @@ def run_with_seed(seed: int = None, verbose: bool = True):
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id),
         generator=g,
     )
 
-    n_classes = len(train_df["labels"].iloc[0])
+    n_classes = NUM_LABELS
 
     model = PretrainedGenreTransformer(n_classes).to(DEVICE)
 
@@ -102,21 +107,31 @@ def run_with_seed(seed: int = None, verbose: bool = True):
 
     optimizer = torch.optim.AdamW(
         [
-            {"params": model.ast.parameters(), "lr": 1e-5},
-            {"params": model.classifier.parameters(), "lr": 1e-4},
+            {"params": model.ast.parameters(), "lr": 1e-6},
+            {"params": model.classifier.parameters(), "lr": 1e-5},
         ],
         weight_decay=1e-4,
     )
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     scaler = GradScaler()
 
-    early_stopping = EarlyStopping(patience=3, min_delta=0.000)
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=total_steps * 0.1, num_training_steps=total_steps
+    )
+
+    early_stopping = EarlyStopping(patience=3, min_delta=0.001)
     best_state = None
-    # scheduler = get_linear_schedule_with_warmup(
-    #     optimizer,
-    #     num_warmup_steps=0,
-    #     num_training_steps=len(dataloader) * EPOCHS,
-    # )
+
+    # for name, param in model.ast.named_parameters():
+    #     if not any(
+    #         layer in name
+    #         for layer in [
+    #             "encoder.layer.10",
+    #             "encoder.layer.11",
+    #         ]
+    #     ):
+    #         param.requires_grad = False
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -137,6 +152,7 @@ def run_with_seed(seed: int = None, verbose: bool = True):
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
+            scheduler.step()
             scaler.update()
 
             total_loss += loss.detach()
@@ -167,13 +183,23 @@ def run_with_seed(seed: int = None, verbose: bool = True):
 
 
 def main() -> None:
-    SEEDS = [42, 123, 2024, 7, 999]
+    SEEDS = [42]
     f1_macros = []
+    best_model = None
     for seed in SEEDS:
         print(f"Running training with seed {seed}...")
         f1_macro, model = run_with_seed(seed=seed, verbose=True)
+        if f1_macro > max(f1_macros, default=0):
+            best_model = model
         f1_macros.append(f1_macro)
         print(f"Seed {seed} | F1 Macro: {f1_macro:.4f}")
+
+    torch.save(
+        {
+            "state_dict": best_model.state_dict(),
+        },
+        "model/final_model.pth",
+    )
 
     avg_f1_macro = sum(f1_macros) / len(f1_macros)
     print(f"Average F1 Macro over seeds: {avg_f1_macro:.4f}")
