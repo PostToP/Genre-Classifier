@@ -7,14 +7,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def download_audio(yt_id: str, folder: Path, start_time: float = None) -> None:
+def download_audio(yt_id: str, folder: Path, duration: float) -> None:
     proxy_url = os.getenv("AUDIO_FETCH_URL", "http://localhost:5000/fetch_audio")
     output_path = folder / f"{yt_id}.m4a"
 
     if proxy_url:
-        params = {"yt_id": yt_id}
-        if start_time is not None:
-            params["start_time"] = start_time
+        params = {"yt_id": yt_id, "duration": duration}
 
         response = requests.get(proxy_url, params=params, stream=True, timeout=120)
         if response.status_code != 200:
